@@ -1,0 +1,3 @@
+phiflow>=2.3.2
+numpy>=1.23
+torch>=2.1
