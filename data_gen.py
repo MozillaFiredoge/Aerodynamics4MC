@@ -248,6 +248,10 @@ def step_flow(
 ) -> Tuple[Any, Any]:
     velocity = advect.semi_lagrangian(velocity, velocity, dt=cfg.dt)
     velocity = apply_inflow(velocity, inflow_mask, cfg.inflow_speed)
+    return make_incompressible(velocity, obstacles, cfg)
+
+
+def make_incompressible(velocity: Any, obstacles: List[object], cfg: GenerationConfig) -> Tuple[Any, Any]:
     solve = Solve(
         method="CG",
         abs_tol=cfg.pressure_tolerance,
@@ -255,7 +259,7 @@ def step_flow(
         max_iterations=cfg.pressure_iterations,
     )
     try:
-        velocity, pressure = fluid.make_incompressible(velocity, obstacles=obstacles, solve=solve)
+        return fluid.make_incompressible(velocity, obstacles=obstacles, solve=solve)
     except (NotConverged, Diverged):
         relaxed_tol = cfg.pressure_tolerance * 10
         fallback = Solve(
@@ -264,29 +268,18 @@ def step_flow(
             rel_tol=relaxed_tol,
             max_iterations=cfg.pressure_iterations * 3,
         )
-        velocity, pressure = fluid.make_incompressible(velocity, obstacles=obstacles, solve=fallback)
-    return velocity, pressure
+        return fluid.make_incompressible(velocity, obstacles=obstacles, solve=fallback)
 
-
-def to_numpy_centered(field: Any) -> np.ndarray:
+def to_numpy_pressure_centered(field: Any) -> np.ndarray:
     return field.values.numpy("x,y,z")
 
-
-def to_numpy_staggered(field: Any) -> np.ndarray:
-    center = CenteredGrid(
-        0.0,
-        bounds=field.bounds,
-        x=field.resolution.spatial["x"].size,
-        y=field.resolution.spatial["y"].size,
-        z=field.resolution.spatial["z"].size,
-    )
-    sampled = field.at(center)
+def to_numpy_velocity_centered(field: Any) -> np.ndarray:
+    sampled = field.at_centers()
     stacked = phi_math.stack(
         [sampled.values.vector["x"], sampled.values.vector["y"], sampled.values.vector["z"]],
         phi_math.channel("vector"),
     )
     return stacked.numpy("x,y,z,vector")
-
 
 def save_sample(out_dir: Path, sample_idx: int, payload: Dict[str, np.ndarray]) -> None:
     out_path = out_dir / f"sample_{sample_idx:05d}.npy"
@@ -314,29 +307,23 @@ def generate_dataset(cfg: GenerationConfig, out_dir: Path) -> None:
         attempts += 1
         obstacle_mask, obstacles = generate_obstacle_mask(cfg)
         velocity = build_velocity_field(cfg, bounds)
-
+        #--- Prewarm the flow, to avoid initial transients ---
         try:
             for _ in range(cfg.warmup_steps):
-                velocity, _ = step_flow(velocity, obstacles, inflow_mask, cfg)
-
+                velocity, pressure = step_flow(velocity, obstacles, inflow_mask, cfg)
+            pressure_t = pressure
             velocity_t = velocity
-            pressure_t = None
-            if cfg.steps_per_sample > 0:
-                _, pressure_t = step_flow(velocity_t, obstacles, inflow_mask, cfg)
             for _ in range(cfg.steps_per_sample):
                 velocity, pressure = step_flow(velocity, obstacles, inflow_mask, cfg)
         except (NotConverged, Diverged):
             continue
 
-        if pressure_t is None:
-            pressure_t = pressure
-
         payload = {
             "obstacle_mask": obstacle_mask.astype(np.uint8),
-            "velocity_t": to_numpy_staggered(velocity_t).astype(np.float32),
-            "velocity_t1": to_numpy_staggered(velocity).astype(np.float32),
-            "pressure_t": to_numpy_centered(pressure_t).astype(np.float32),
-            "pressure_t1": to_numpy_centered(pressure).astype(np.float32),
+            "velocity_t": to_numpy_velocity_centered(velocity_t).astype(np.float32),
+            "velocity_t1": to_numpy_velocity_centered(velocity).astype(np.float32),
+            "pressure_t": to_numpy_pressure_centered(pressure_t).astype(np.float32),
+            "pressure_t1": to_numpy_pressure_centered(pressure).astype(np.float32),
         }
 
         if not all(np.isfinite(value).all() for value in payload.values()):
