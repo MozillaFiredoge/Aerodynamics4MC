@@ -20,7 +20,6 @@ import matplotlib.colors as mcolors
 from mpl_toolkits.mplot3d import Axes3D
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
-
 def load_sample(sample_path: Path) -> Dict[str, np.ndarray]:
     """Load a single sample from .npy file."""
     data = np.load(sample_path, allow_pickle=True).item()
@@ -124,12 +123,13 @@ def visualize_velocity_field(velocity: np.ndarray, figsize: tuple = (15, 10)):
     axes[0, 0].set_xlabel('X')
     axes[0, 0].set_ylabel('Y')
     plt.colorbar(im0, ax=axes[0, 0], label='|V|')
-    
+
     # Plot vector arrows (downsampled)
     axes[0, 1].quiver(X[::step, ::step], Y[::step, ::step],
                      velocity[::step, ::step, mid_z, 0].T,
                      velocity[::step, ::step, mid_z, 1].T,
-                     color='white', scale=20)
+                     color='blue', scale=10)
+                     
     axes[0, 1].set_title(f'XY Slice - Velocity Vectors (U,V)')
     axes[0, 1].set_xlabel('X')
     axes[0, 1].set_ylabel('Y')
@@ -153,11 +153,11 @@ def visualize_velocity_field(velocity: np.ndarray, figsize: tuple = (15, 10)):
     axes[1, 0].set_xlabel('X')
     axes[1, 0].set_ylabel('Z')
     plt.colorbar(im1, ax=axes[1, 0], label='|V|')
-    
+
     axes[1, 1].quiver(X[::step, ::step], Z[::step, ::step],
                      velocity[::step, mid_y, ::step, 0].T,
                      velocity[::step, mid_y, ::step, 2].T,
-                     color='white', scale=20)
+                     color='blue', scale=10)
     axes[1, 1].set_title(f'XZ Slice - Velocity Vectors (U,W)')
     axes[1, 1].set_xlabel('X')
     axes[1, 1].set_ylabel('Z')
@@ -242,7 +242,7 @@ def visualize_sample_comparison(sample_t: Dict[str, np.ndarray],
         
         # Vector field in 3D (downsampled)
         ax3 = fig_3d.add_subplot(233, projection='3d')
-        step = max(1, sample_t['velocity_t'].shape[0] // 6)
+        step = max(1, sample_t['velocity_t'].shape[0] // 10)
         X, Y, Z = np.meshgrid(np.arange(0, sample_t['velocity_t'].shape[0], step),
                              np.arange(0, sample_t['velocity_t'].shape[1], step),
                              np.arange(0, sample_t['velocity_t'].shape[2], step), indexing='ij')
@@ -250,18 +250,23 @@ def visualize_sample_comparison(sample_t: Dict[str, np.ndarray],
         U = sample_t['velocity_t'][::step, ::step, ::step, 0].flatten()
         V = sample_t['velocity_t'][::step, ::step, ::step, 1].flatten()
         W = sample_t['velocity_t'][::step, ::step, ::step, 2].flatten()
+
+        mags = np.sqrt(U**2 + V**2 + W**2)
+        max_v = np.max(mags)
+        dynamic_length = 3.0 / max_v if max_v > 0 else 1.0
+        threshold = np.max(mags) * 0.005 
+        U[mags < threshold] = np.nan
+        V[mags < threshold] = np.nan
+        W[mags < threshold] = np.nan
+
+        ax3.quiver(X.flatten(), Y.flatten(), Z.flatten(),
+                        U, V, W, length=int(dynamic_length), 
+                        normalize=False, cmap='viridis')
         
-        # Color by magnitude
-        colors = np.sqrt(U**2 + V**2 + W**2)
-        
-        quiver = ax3.quiver(X.flatten(), Y.flatten(), Z.flatten(),
-                           U, V, W, length=1, 
-                           normalize=True, cmap='viridis')
         ax3.set_title('3D Velocity Vectors')
         ax3.set_xlabel('X')
         ax3.set_ylabel('Y')
         ax3.set_zlabel('Z')
-        plt.colorbar(quiver, ax=ax3, label='Velocity Magnitude')
         
         plt.tight_layout()
         plt.show()
