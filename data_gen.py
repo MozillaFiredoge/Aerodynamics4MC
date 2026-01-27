@@ -36,26 +36,40 @@ class GenerationConfig:
     grid_size: int = 32
     num_samples: int = 100
     out_dir: str = "data"
-    steps_per_sample: int = 5
-    warmup_steps: int = 320
+    steps_per_sample: int = 20
+    warmup_steps: int = random.randint(5, 20)
     dt: float = 0.1
     inflow_speed: float = 1.0
     max_obstacles: int = 5
     min_obstacles: int = 1
-    obstacle_density_cap: float = 0.35
-    pressure_iterations: int = 100
+    obstacle_density_cap: float = 0.5
+    pressure_iterations: int = 700
     pressure_tolerance: float = 1e-5 # Stricter tolerance is fine now
     seed: int | None = 7
+    obstacle_move_range: int = 1
+    obstacle_move_prob: float = 0.0
+    obstacle_resize_prob: float = 0.0
+    obstacle_add_prob: float = 0.0
+    obstacle_remove_prob: float = 0.0
+    voxel_add_prob: float = 0.5
+    voxel_remove_prob: float = 0.5
+    voxel_max_count: int = 64
 
  
 OBSTACLE_TYPES = ("cube", "wall", "sphere")
 
 
+@dataclass
+class ObstacleSpec:
+    kind: str
+    params: Dict[str, Any]
+
+
 def make_box(lower: Tuple[float, float, float], upper: Tuple[float, float, float]) -> Any:
     return Box(
-        x=(lower[0], upper[0]),
-        y=(lower[1], upper[1]),
-        z=(lower[2], upper[2]),
+        x=(lower[0], upper[0]), # type: ignore
+        y=(lower[1], upper[1]), # type: ignore
+        z=(lower[2], upper[2]), # type: ignore
     )
 
 
@@ -63,9 +77,9 @@ def make_sphere(center: Tuple[float, float, float], radius: float) -> Any:
     return cast(
         Any,
         Sphere(
-            x=center[0],
-            y=center[1],
-            z=center[2],
+            x=center[0], # type: ignore
+            y=center[1], # type: ignore
+            z=center[2], # type: ignore
             radius=radius,
         ),
     )
@@ -94,80 +108,88 @@ def _random_float(low: float, high: float) -> float:
     return random.uniform(low, high)
 
 
-def generate_obstacle_mask(cfg: GenerationConfig) -> Tuple[np.ndarray, List[object]]:
-    """
-    Generates obstacles with safety margins to prevent blocking inflow/outflow.
-    """
+def _clamp(value: int, low: int, high: int) -> int:
+    return max(low, min(high, value))
+
+
+def _margins(cfg: GenerationConfig) -> Tuple[int, int]:
+    margin_x = max(8, cfg.grid_size // 4)
+    margin_yz = 2
+    return margin_x, margin_yz
+
+
+def _random_obstacle_spec(cfg: GenerationConfig) -> ObstacleSpec:
+    grid = cfg.grid_size
+    margin_x, margin_yz = _margins(cfg)
+    obstacle_type = random.choice(OBSTACLE_TYPES)
+    if obstacle_type == "cube":
+        size = _random_int(3, max(4, grid // 4))
+        x0 = _random_int(margin_x, grid - margin_x - size)
+        y0 = _random_int(margin_yz, grid - margin_yz - size)
+        z0 = _random_int(margin_yz, grid - margin_yz - size)
+        return ObstacleSpec("cube", {"x0": x0, "y0": y0, "z0": z0, "size": size})
+    if obstacle_type == "wall":
+        thickness = _random_int(1, 2)
+        orientation = random.choice(["y", "z"])
+        if orientation == "y":
+            y0 = _random_int(margin_yz, grid - margin_yz - thickness)
+            x_start = _random_int(margin_x, grid // 2)
+            x_len = _random_int(4, grid // 2)
+            return ObstacleSpec(
+                "wall",
+                {"orientation": "y", "y0": y0, "thickness": thickness, "x_start": x_start, "x_len": x_len},
+            )
+        z0 = _random_int(margin_yz, grid - margin_yz - thickness)
+        x_start = _random_int(margin_x, grid // 2)
+        x_len = _random_int(4, grid // 2)
+        return ObstacleSpec(
+            "wall",
+            {"orientation": "z", "z0": z0, "thickness": thickness, "x_start": x_start, "x_len": x_len},
+        )
+    radius = _random_int(2, max(3, grid // 6))
+    center = (
+        _random_float(margin_x + radius, grid - margin_x - radius),
+        _random_float(margin_yz + radius, grid - margin_yz - radius),
+        _random_float(margin_yz + radius, grid - margin_yz - radius),
+    )
+    return ObstacleSpec("sphere", {"center": center, "radius": radius})
+
+
+def _random_voxel_spec(cfg: GenerationConfig, occupied: np.ndarray) -> ObstacleSpec | None:
+    margin_x, margin_yz = _margins(cfg)
+    for _ in range(20):
+        x = _random_int(margin_x, cfg.grid_size - margin_x - 1)
+        y = _random_int(margin_yz, cfg.grid_size - margin_yz - 1)
+        z = _random_int(margin_yz, cfg.grid_size - margin_yz - 1)
+        if occupied[x, y, z] == 0:
+            return ObstacleSpec("voxel", {"x": x, "y": y, "z": z})
+    return None
+
+
+def _rasterize_obstacles(cfg: GenerationConfig, specs: List[ObstacleSpec]) -> np.ndarray:
     grid = cfg.grid_size
     mask = np.zeros((grid, grid, grid), dtype=np.uint8)
-    obstacles: List[object] = []
-
-    # Safe margin
-    margin_x = max(8, grid // 4)
-    margin_yz = 2
-
-    obstacle_count = _random_int(cfg.min_obstacles, cfg.max_obstacles)
-    
-    # Safety check for small grids
-    if grid < 10:
-        return mask, obstacles
-
-    for _ in range(obstacle_count):
-        obstacle_type = random.choice(OBSTACLE_TYPES)
-        
-        if obstacle_type == "cube":
-            size = _random_int(3, max(4, grid // 4))
-            # Restrict X placement
-            x0 = _random_int(margin_x, grid - margin_x - size)
-            y0 = _random_int(margin_yz, grid - margin_yz - size)
-            z0 = _random_int(margin_yz, grid - margin_yz - size)
-            
+    for spec in specs:
+        if spec.kind == "cube":
+            x0 = int(spec.params["x0"])
+            y0 = int(spec.params["y0"])
+            z0 = int(spec.params["z0"])
+            size = int(spec.params["size"])
             mask[x0 : x0 + size, y0 : y0 + size, z0 : z0 + size] = 1
-            obstacles.append(
-                make_box((x0, y0, z0), (x0 + size, y0 + size, z0 + size))
-            )
-            
-        elif obstacle_type == "wall":
-            thickness = _random_int(1, 2)
-            orientation = random.choice(["y", "z"]) # Avoid X-walls that block flow completely
-            
+        elif spec.kind == "wall":
+            orientation = spec.params["orientation"]
+            thickness = int(spec.params["thickness"])
+            x_start = int(spec.params["x_start"])
+            x_len = int(spec.params["x_len"])
             if orientation == "y":
-                # Wall spanning X-Z plane? No, let's keep it simple.
-                # Wall perpendicular to Y axis      
-                y0 = _random_int(margin_yz, grid - margin_yz - thickness)
-                # Ensure it doesn't span full X if possible, or allow it but flow goes around
-                # Here we make partial walls
-                x_start = _random_int(margin_x, grid // 2)
-                x_len = _random_int(4, grid // 2)
-                
+                y0 = int(spec.params["y0"])
                 mask[x_start : x_start + x_len, y0 : y0 + thickness, 2:-2] = 1
-                obstacles.append(
-                    make_box(
-                        (x_start, y0, 2),
-                        (x_start + x_len, y0 + thickness, grid - 2),
-                    )
-                )
             else:
-                # Wall perpendicular to Z axis
-                z0 = _random_int(margin_yz, grid - margin_yz - thickness)
-                x_start = _random_int(margin_x, grid // 2)
-                x_len = _random_int(4, grid // 2)
-
+                z0 = int(spec.params["z0"])
                 mask[x_start : x_start + x_len, 2:-2, z0 : z0 + thickness] = 1
-                obstacles.append(
-                    make_box(
-                        (x_start, 2, z0),
-                        (x_start + x_len, grid - 2, z0 + thickness),
-                    )
-                )
-                
-        else: # Sphere
-            radius = _random_int(2, max(3, grid // 6))
-            center = (
-                _random_float(margin_x + radius, grid - margin_x - radius),
-                _random_float(margin_yz + radius, grid - margin_yz - radius),
-                _random_float(margin_yz + radius, grid - margin_yz - radius),
-            )
+        elif spec.kind == "sphere":
+            center = cast(Tuple[float, float, float], spec.params["center"])
+            radius = float(spec.params["radius"])
             xs = np.arange(grid).reshape(-1, 1, 1)
             ys = np.arange(grid).reshape(1, -1, 1)
             zs = np.arange(grid).reshape(1, 1, -1)
@@ -175,12 +197,135 @@ def generate_obstacle_mask(cfg: GenerationConfig) -> Tuple[np.ndarray, List[obje
                 (xs - center[0]) ** 2 + (ys - center[1]) ** 2 + (zs - center[2]) ** 2
             )
             mask[dist <= radius] = 1
-            obstacles.append(make_sphere(center, float(radius)))
+        elif spec.kind == "voxel":
+            x = int(spec.params["x"])
+            y = int(spec.params["y"])
+            z = int(spec.params["z"])
+            mask[x, y, z] = 1
+    return mask
 
-    occupied = mask.mean()
-    if occupied > cfg.obstacle_density_cap:
+
+def _specs_to_phi(cfg: GenerationConfig, specs: List[ObstacleSpec]) -> List[object]:
+    obstacles: List[object] = []
+    for spec in specs:
+        if spec.kind == "cube":
+            x0 = float(spec.params["x0"])
+            y0 = float(spec.params["y0"])
+            z0 = float(spec.params["z0"])
+            size = float(spec.params["size"])
+            obstacles.append(make_box((x0, y0, z0), (x0 + size, y0 + size, z0 + size)))
+        elif spec.kind == "wall":
+            orientation = spec.params["orientation"]
+            thickness = float(spec.params["thickness"])
+            x_start = float(spec.params["x_start"])
+            x_len = float(spec.params["x_len"])
+            if orientation == "y":
+                y0 = float(spec.params["y0"])
+                obstacles.append(make_box((x_start, y0, 2), (x_start + x_len, y0 + thickness, cfg.grid_size - 2)))
+            else:
+                z0 = float(spec.params["z0"])
+                obstacles.append(make_box((x_start, 2, z0), (x_start + x_len, cfg.grid_size - 2, z0 + thickness)))
+        elif spec.kind == "sphere":
+            center = cast(Tuple[float, float, float], spec.params["center"])
+            radius = float(spec.params["radius"])
+            obstacles.append(make_sphere(center, radius))
+        elif spec.kind == "voxel":
+            x = float(spec.params["x"])
+            y = float(spec.params["y"])
+            z = float(spec.params["z"])
+            obstacles.append(make_box((x, y, z), (x + 1.0, y + 1.0, z + 1.0)))
+    return obstacles
+
+
+def _update_obstacles(cfg: GenerationConfig, specs: List[ObstacleSpec]) -> List[ObstacleSpec]:
+    grid = cfg.grid_size
+    margin_x, margin_yz = _margins(cfg)
+    updated: List[ObstacleSpec] = []
+    voxel_specs = [spec for spec in specs if spec.kind == "voxel"]
+    macro_specs = [spec for spec in specs if spec.kind != "voxel"]
+
+    for spec in macro_specs:
+        if random.random() < cfg.obstacle_remove_prob:
+            continue
+        dx = _random_int(-cfg.obstacle_move_range, cfg.obstacle_move_range) if random.random() < cfg.obstacle_move_prob else 0
+        dy = _random_int(-cfg.obstacle_move_range, cfg.obstacle_move_range) if random.random() < cfg.obstacle_move_prob else 0
+        dz = _random_int(-cfg.obstacle_move_range, cfg.obstacle_move_range) if random.random() < cfg.obstacle_move_prob else 0
+        if spec.kind == "cube":
+            size = int(spec.params["size"])
+            if random.random() < cfg.obstacle_resize_prob:
+                size = _clamp(size + random.choice([-1, 1]), 2, max(3, grid // 3))
+            x0 = _clamp(int(spec.params["x0"]) + dx, margin_x, grid - margin_x - size)
+            y0 = _clamp(int(spec.params["y0"]) + dy, margin_yz, grid - margin_yz - size)
+            z0 = _clamp(int(spec.params["z0"]) + dz, margin_yz, grid - margin_yz - size)
+            updated.append(ObstacleSpec("cube", {"x0": x0, "y0": y0, "z0": z0, "size": size}))
+        elif spec.kind == "wall":
+            orientation = spec.params["orientation"]
+            thickness = int(spec.params["thickness"])
+            x_start = int(spec.params["x_start"])
+            x_len = int(spec.params["x_len"])
+            if random.random() < cfg.obstacle_resize_prob:
+                thickness = _clamp(thickness + random.choice([-1, 1]), 1, 3)
+                x_len = _clamp(x_len + random.choice([-2, 2]), 3, grid // 2)
+            x_start = _clamp(x_start + dx, margin_x, grid - margin_x - x_len)
+            if orientation == "y":
+                y0 = _clamp(int(spec.params["y0"]) + dy, margin_yz, grid - margin_yz - thickness)
+                updated.append(
+                    ObstacleSpec(
+                        "wall",
+                        {"orientation": "y", "y0": y0, "thickness": thickness, "x_start": x_start, "x_len": x_len},
+                    )
+                )
+            else:
+                z0 = _clamp(int(spec.params["z0"]) + dz, margin_yz, grid - margin_yz - thickness)
+                updated.append(
+                    ObstacleSpec(
+                        "wall",
+                        {"orientation": "z", "z0": z0, "thickness": thickness, "x_start": x_start, "x_len": x_len},
+                    )
+                )
+        else:
+            center = list(cast(Tuple[float, float, float], spec.params["center"]))
+            radius = float(spec.params["radius"])
+            if random.random() < cfg.obstacle_resize_prob:
+                radius = _clamp(int(radius + random.choice([-1, 1])), 2, max(3, grid // 5))
+            center[0] = _clamp(int(center[0] + dx), margin_x + int(radius), grid - margin_x - int(radius))
+            center[1] = _clamp(int(center[1] + dy), margin_yz + int(radius), grid - margin_yz - int(radius))
+            center[2] = _clamp(int(center[2] + dz), margin_yz + int(radius), grid - margin_yz - int(radius))
+            updated.append(ObstacleSpec("sphere", {"center": tuple(center), "radius": radius}))
+
+    # Voxel-level mutations
+    if voxel_specs and random.random() < cfg.voxel_remove_prob:
+        voxel_specs.pop(random.randrange(len(voxel_specs)))
+
+    current_mask = _rasterize_obstacles(cfg, updated + voxel_specs)
+    if random.random() < cfg.voxel_add_prob and len(voxel_specs) < cfg.voxel_max_count:
+        new_voxel = _random_voxel_spec(cfg, current_mask)
+        if new_voxel is not None:
+            voxel_specs.append(new_voxel)
+
+    if random.random() < cfg.obstacle_add_prob:
+        updated.append(_random_obstacle_spec(cfg))
+
+    # Ensure density cap by trimming obstacles if needed
+    while updated and _rasterize_obstacles(cfg, updated + voxel_specs).mean() > cfg.obstacle_density_cap:
+        updated.pop(random.randrange(len(updated)))
+
+    return updated + voxel_specs
+
+
+def generate_obstacle_mask(cfg: GenerationConfig) -> Tuple[np.ndarray, List[ObstacleSpec]]:
+    """
+    Generates obstacles with safety margins to prevent blocking inflow/outflow.
+    """
+    grid = cfg.grid_size
+    if grid < 10:
+        return np.zeros((grid, grid, grid), dtype=np.uint8), []
+    obstacle_count = _random_int(cfg.min_obstacles, cfg.max_obstacles)
+    specs = [_random_obstacle_spec(cfg) for _ in range(obstacle_count)]
+    mask = _rasterize_obstacles(cfg, specs)
+    if mask.mean() > cfg.obstacle_density_cap:
         return generate_obstacle_mask(cfg)
-    return mask, obstacles
+    return mask, specs
 
 
 def build_inflow_mask(cfg: GenerationConfig) -> np.ndarray:
@@ -207,8 +352,8 @@ def build_velocity_field(cfg: GenerationConfig, bounds: Any) -> Any:
 
     v_extrap = extrapolation.combine_sides(
         x=extrapolation.ZERO_GRADIENT,
-        y=extrapolation.ZERO,
-        z=extrapolation.ZERO
+        y=extrapolation.ZERO_GRADIENT,
+        z=extrapolation.ZERO_GRADIENT
     )
     
     return StaggeredGrid(
@@ -221,10 +366,11 @@ def build_velocity_field(cfg: GenerationConfig, bounds: Any) -> Any:
     )
 
 
-def apply_inflow(velocity: Any, inflow_mask: Any, inflow_speed: float) -> Any:
+def apply_inflow(velocity: Any, inflow_mask: Any, inflow_speed: float, t: int) -> Any:
+    u = inflow_speed * (0.5 + 0.5 * phi_math.sin(0.2 * t))
     # Use the grid's existing extrapolation for the new field
     inflow = StaggeredGrid(
-        vec(x=inflow_speed, y=0.0, z=0.0),
+        vec(x=u, y=0.2 * phi_math.sin(t), z=0.2 * phi_math.cos(t)),
         bounds=velocity.bounds,
         extrapolation=velocity.extrapolation,
         x=velocity.resolution.spatial["x"].size,
@@ -236,12 +382,13 @@ def apply_inflow(velocity: Any, inflow_mask: Any, inflow_speed: float) -> Any:
     return velocity * (1 - inflow_mask_staggered) + inflow * inflow_mask_staggered
 
 # JIT Compile the physics step for massive speedup
-@phi_math.jit_compile
+#@phi_math.jit_compile
 def step_flow_jit(
     velocity: Any,
     pressure_guess: Any,
     obstacles: List[object],
     inflow_mask: Any,
+    t: int,
     dt: float,
     inflow_speed: float,
     tolerance: float,
@@ -251,9 +398,9 @@ def step_flow_jit(
     # 1. Advect
     velocity = advect.semi_lagrangian(velocity, velocity, dt=dt)
     # 2. Diffuse
-    velocity = diffuse.explicit(velocity, diffusivity=1e-3, dt=dt)
+    velocity = diffuse.explicit(velocity, diffusivity=1.8e-5, dt=dt)
     # 3. Apply Inflow Boundary Condition (Dirichlet on velocity)
-    velocity = apply_inflow(velocity, inflow_mask, inflow_speed)
+    velocity = apply_inflow(velocity, inflow_mask, inflow_speed, t)
     
     # 4. Projection (Make Incompressible)
     solve = Solve(
@@ -261,7 +408,7 @@ def step_flow_jit(
         abs_tol=tolerance,
         rel_tol=tolerance,
         max_iterations=max_iter,
-        rank_deficiency=0,
+        #rank_deficiency=0, # No nullspace for open boundaries
         x0=pressure_guess # Warm start pressure solver
     )
     
@@ -300,7 +447,7 @@ def save_metadata(out_dir: Path, cfg: GenerationConfig) -> None:
 
 def generate_dataset(cfg: GenerationConfig, out_dir: Path) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
-    bounds = Box(x=cfg.grid_size, y=cfg.grid_size, z=cfg.grid_size)
+    bounds = Box(x=cfg.grid_size, y=cfg.grid_size, z=cfg.grid_size) # type: ignore
     inflow_mask_np = build_inflow_mask(cfg)
     inflow_mask = field_from_mask(inflow_mask_np, bounds)
 
@@ -319,29 +466,45 @@ def generate_dataset(cfg: GenerationConfig, out_dir: Path) -> None:
 
     while sample_idx < cfg.num_samples:
         attempts += 1
-        obstacle_mask, obstacles = generate_obstacle_mask(cfg)
+        obstacle_mask, obstacle_specs = generate_obstacle_mask(cfg)
         velocity = build_velocity_field(cfg, bounds)
         pressure = initial_pressure
+        t = 0
+        obstacle_mask_t = obstacle_mask
         # Warmup
         try:
             for _ in range(cfg.warmup_steps):
+                obstacle_specs = _update_obstacles(cfg, obstacle_specs)
+                obstacle_mask = _rasterize_obstacles(cfg, obstacle_specs)
+                obstacles = _specs_to_phi(cfg, obstacle_specs)
                 velocity, pressure = step_flow_jit(
-                    velocity, pressure, obstacles, inflow_mask, 
-                    cfg.dt, cfg.inflow_speed, cfg.pressure_tolerance, cfg.pressure_iterations
+                    velocity, pressure, obstacles, inflow_mask,
+                    t, cfg.dt, cfg.inflow_speed, cfg.pressure_tolerance, cfg.pressure_iterations
                 )
+                t += 1
             velocity_t = velocity
             pressure_t = pressure # Capturing pressure input is rare for simple datasets but requested
+            obstacle_mask_t = obstacle_mask
             div = fluid.divergence(velocity)
             mean_div = float(phi_math.mean(phi_math.abs(div.values)).numpy())
             momentum = phi_math.mean(velocity.values).numpy("vector")
-            #energy = field.mean(field.l2_loss(velocity)).values
             print(f"Attempt {attempts}: Warmup complete, divergence = {mean_div}, total momentum = {momentum}. Generating sample...")
             # Step to Target
+            velocity_n = []
+            pressure_n = []
+            obstacle_mask_n = []
             for _ in range(cfg.steps_per_sample):
+                obstacle_specs = _update_obstacles(cfg, obstacle_specs)
+                obstacle_mask = _rasterize_obstacles(cfg, obstacle_specs)
+                obstacles = _specs_to_phi(cfg, obstacle_specs)
                 velocity, pressure = step_flow_jit(
-                    velocity, pressure, obstacles, inflow_mask, 
-                    cfg.dt, cfg.inflow_speed, cfg.pressure_tolerance, cfg.pressure_iterations
+                    velocity, pressure, obstacles, inflow_mask,
+                    t, cfg.dt, cfg.inflow_speed, cfg.pressure_tolerance, cfg.pressure_iterations
                 )
+                velocity_n.append(to_numpy_velocity_centered(velocity).astype(np.float32))
+                pressure_n.append(to_numpy_pressure_centered(pressure).astype(np.float32))
+                obstacle_mask_n.append(obstacle_mask.astype(np.bool_))
+                t += 1
             div = fluid.divergence(velocity)
             mean_div = float(phi_math.mean(phi_math.abs(div.values)).numpy())
             momentum = phi_math.mean(velocity.values).numpy("vector")
@@ -356,11 +519,12 @@ def generate_dataset(cfg: GenerationConfig, out_dir: Path) -> None:
         # Data Export
         # Note: We cast to float32 immediately to save space
         payload = {
-            "obstacle_mask": obstacle_mask.astype(np.bool_),
+            "obstacle_mask": obstacle_mask_t.astype(np.bool_),
+            "obstacle_mask_tn": np.stack(obstacle_mask_n, axis=0),
             "velocity_t": to_numpy_velocity_centered(velocity_t).astype(np.float32),
-            "velocity_t1": to_numpy_velocity_centered(velocity).astype(np.float32),
+            "velocity_tn": np.stack(velocity_n, axis=0),
             "pressure_t": to_numpy_pressure_centered(pressure_t).astype(np.float32),
-            "pressure_t1": to_numpy_pressure_centered(pressure).astype(np.float32),
+            "pressure_tn": np.stack(pressure_n, axis=0),
         }
         # NaN check
         if any(np.isnan(v).any() for v in payload.values() if isinstance(v, np.ndarray)):
