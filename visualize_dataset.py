@@ -17,6 +17,7 @@ import matplotlib.cm as cm
 from matplotlib.patches import Patch
 from matplotlib.lines import Line2D
 import matplotlib.colors as mcolors
+from matplotlib import animation
 from mpl_toolkits.mplot3d import Axes3D
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
@@ -253,15 +254,15 @@ def visualize_sample_comparison(sample_t: Dict[str, np.ndarray],
 
         mags = np.sqrt(U**2 + V**2 + W**2)
         max_v = np.max(mags)
-        dynamic_length = 3.0 / max_v if max_v > 0 else 1.0
+        dynamic_length = max_v / 5 if max_v > 0 else 1.0
         threshold = np.max(mags) * 0.005 
         U[mags < threshold] = np.nan
         V[mags < threshold] = np.nan
         W[mags < threshold] = np.nan
 
         ax3.quiver(X.flatten(), Y.flatten(), Z.flatten(),
-                        U, V, W, length=int(dynamic_length), 
-                        normalize=False, cmap='viridis')
+                        U, V, W, length=1, 
+                        normalize=True, cmap='viridis')
         
         ax3.set_title('3D Velocity Vectors')
         ax3.set_xlabel('X')
@@ -409,6 +410,80 @@ def visualize_statistics(data_dir: Path, num_samples: int = 10):
     plt.show()
 
 
+def _take_slice(volume: np.ndarray, axis: str, idx: int) -> np.ndarray:
+    if axis == "x":
+        return volume[idx, :, :]
+    if axis == "y":
+        return volume[:, idx, :]
+    return volume[:, :, idx]
+
+
+def animate_rollout(
+    sample: Dict[str, np.ndarray],
+    axis: str = "y",
+    steps: Optional[int] = None,
+    fps: int = 6,
+    save_path: Optional[Path] = None,
+    show: bool = True,
+):
+    if "velocity_tn" not in sample or "pressure_tn" not in sample:
+        print("Sample missing velocity_tn/pressure_tn; rollout animation skipped.")
+        return
+
+    velocity_seq = sample["velocity_tn"]
+    pressure_seq = sample["pressure_tn"]
+    if pressure_seq.ndim == 5:
+        pressure_seq = pressure_seq[..., 0]
+
+    total_steps = velocity_seq.shape[0]
+    steps = min(steps or total_steps, total_steps)
+    velocity_seq = velocity_seq[:steps]
+    pressure_seq = pressure_seq[:steps]
+
+    axis_idx = {"x": 0, "y": 1, "z": 2}[axis]
+    mid = velocity_seq.shape[axis_idx + 1] // 2
+    mask = sample["obstacle_mask"].astype(np.float32)
+    mask_slice = _take_slice(mask, axis, mid)
+
+    vel_mag = np.linalg.norm(velocity_seq, axis=-1)
+    vel_slices = [_take_slice(vel_mag[t], axis, mid) for t in range(steps)]
+    pressure_slices = [_take_slice(pressure_seq[t], axis, mid) for t in range(steps)]
+
+    vel_max = max(np.max(v) for v in vel_slices) if vel_slices else 1.0
+    pres_abs = max(np.max(np.abs(p)) for p in pressure_slices) if pressure_slices else 1.0
+
+    fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+    im_v = axes[0].imshow(vel_slices[0], origin="lower", cmap="viridis", vmin=0, vmax=vel_max)
+    im_p = axes[1].imshow(pressure_slices[0], origin="lower", cmap="coolwarm", vmin=-pres_abs, vmax=pres_abs)
+    axes[0].set_title("Velocity |v|")
+    axes[1].set_title("Pressure")
+    for ax in axes:
+        ax.set_xticks([])
+        ax.set_yticks([])
+        ax.contour(mask_slice, levels=[0.5], colors="k", linewidths=0.5)
+
+    fig.tight_layout()
+
+    def update(frame: int):
+        im_v.set_data(vel_slices[frame])
+        im_p.set_data(pressure_slices[frame])
+        fig.suptitle(f"Rollout frame {frame + 1}/{steps}")
+        return [im_v, im_p]
+
+    interval_ms = 1000 / max(fps, 1)
+    ani = animation.FuncAnimation(fig, update, frames=steps, interval=interval_ms, blit=False)
+
+    if save_path:
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        writer = "pillow" if save_path.suffix.lower() == ".gif" else "ffmpeg"
+        ani.save(save_path, writer=writer, fps=fps)
+        print(f"Saved rollout animation to {save_path}")
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Visualize PhiFlow 3D flow dataset")
     parser.add_argument("--data-dir", type=str, required=True,
@@ -423,6 +498,16 @@ def main():
                        help="Number of samples to use for statistics")
     parser.add_argument("--compare-time-steps", action="store_true",
                        help="Compare velocity at T and T+1 for the same sample")
+    parser.add_argument("--rollout-anim", action="store_true",
+                       help="Show rollout animation from velocity_tn/pressure_tn")
+    parser.add_argument("--rollout-steps", type=int, default=None,
+                       help="Number of rollout frames to animate")
+    parser.add_argument("--slice-axis", type=str, default="y", choices=["x", "y", "z"],
+                       help="Axis for rollout slice animation")
+    parser.add_argument("--rollout-save", type=str, default=None,
+                       help="Optional path to save rollout animation (.gif/.mp4)")
+    parser.add_argument("--rollout-fps", type=int, default=6,
+                       help="FPS for rollout animation")
     
     args = parser.parse_args()
     
@@ -458,6 +543,17 @@ def main():
         print(f"Loading sample {args.sample_idx}: {sample_path.name}")
         
         sample_t = load_sample(sample_path)
+
+        if args.rollout_anim:
+            animate_rollout(
+                sample_t,
+                axis=args.slice_axis,
+                steps=args.rollout_steps,
+                fps=args.rollout_fps,
+                save_path=Path(args.rollout_save) if args.rollout_save else None,
+                show=args.rollout_save is None,
+            )
+            return
         
         if args.compare_time_steps:
             # For comparison, we need to load the same sample but show both time steps
