@@ -1,0 +1,59 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Training / data artifacts
+train_data/
+trian_data/
+val_data/
+train_dataset/
+data/
+data_fixed/
+data_test/
+runs/
+runs_*/
+outputs/
+checkpoints/
+checkpoint_*.pt
+
+# Generated media / reports
+cfd_sample_*_animation.html
+
+# Logs
+*.log
+
+# Editor / OS
+.vscode/
+.idea/
+*.iml
+.DS_Store
+
+# Fabric/Gradle build artifacts
+fabric-mod/
+fabric-mod/.gradle/
+fabric-mod/build/
+fabric-mod/out/
+fabric-mod/run/
+fabric-mod/bin/
+fabric-mod/classes/
+fabric-mod/.settings/
+fabric-mod/.classpath
+fabric-mod/.project
+
+# Native build artifacts
+fabric-mod/native/build/
+fabric-mod/native/build-*/
+fabric-mod/native/build-all/
+fabric-mod/native/dist/
